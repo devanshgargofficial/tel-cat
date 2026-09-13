@@ -20,9 +20,9 @@ bot = Bot(TOKEN)
 async def get_shop_data(user_id: int):
     async with connection() as db:
         category_cursor = await db.execute(
-            """SELECT DISTINCT category FROM products
+            """SELECT DISTINCT category, LOWER(category) AS category_sort FROM products
                WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
-               ORDER BY LOWER(category)""",
+               ORDER BY category_sort""",
             (user_id,),
         )
         categories = [row["category"] for row in await category_cursor.fetchall()]

@@ -209,10 +209,10 @@ async def show_catalog(message: Message):
 async def list_categories(message: Message):
     async with connection() as db:
         cursor = await db.execute("""
-            SELECT DISTINCT category
+            SELECT DISTINCT category, LOWER(category) AS category_sort
             FROM products
             WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
-            ORDER BY category COLLATE NOCASE
+            ORDER BY category_sort
         """, (message.from_user.id,))
         categories = [row["category"] for row in await cursor.fetchall()]
 
@@ -237,10 +237,10 @@ async def category_selected(callback: CallbackQuery):
     category_index = int(callback.data.split(":", 1)[1])
     async with connection() as db:
         cursor = await db.execute("""
-            SELECT DISTINCT category
+            SELECT DISTINCT category, LOWER(category) AS category_sort
             FROM products
             WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
-            ORDER BY category COLLATE NOCASE
+            ORDER BY category_sort
             LIMIT 1 OFFSET %s
         """, (callback.from_user.id, category_index))
         selected = await cursor.fetchone()
