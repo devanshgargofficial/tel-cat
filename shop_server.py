@@ -2,15 +2,14 @@ import html
 import io
 import json
 import os
-from pathlib import Path
 
-import aiosqlite
 from aiohttp import web
 from aiogram import Bot
 from dotenv import load_dotenv
 
-DATABASE = Path(__file__).with_name("catalogue.db")
-load_dotenv(DATABASE.with_name(".env"))
+load_dotenv()
+from database import close_db, connection, init_db
+
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
   raise RuntimeError("Set the BOT_TOKEN environment variable before starting the shop")
@@ -19,18 +18,18 @@ bot = Bot(TOKEN)
 
 
 async def get_shop_data(user_id: int):
-    async with aiosqlite.connect(DATABASE) as db:
+    async with connection() as db:
         category_cursor = await db.execute(
             """SELECT DISTINCT category FROM products
-               WHERE user_id = ? AND category IS NOT NULL AND TRIM(category) != ''
+               WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
                ORDER BY category COLLATE NOCASE""",
             (user_id,),
         )
-        categories = [row[0] for row in await category_cursor.fetchall()]
+        categories = [row["category"] for row in await category_cursor.fetchall()]
 
         product_cursor = await db.execute(
             """SELECT id, name, description, price, category, stock
-               FROM products WHERE user_id = ? ORDER BY id DESC""",
+               FROM products WHERE user_id = %s ORDER BY id DESC""",
             (user_id,),
         )
         products = await product_cursor.fetchall()
@@ -39,7 +38,12 @@ async def get_shop_data(user_id: int):
 
 
 def product_card(product):
-    product_id, name, description, price, category, stock = product
+    product_id = product["id"]
+    name = product["name"]
+    description = product["description"]
+    price = product["price"]
+    category = product["category"]
+    stock = product["stock"]
     name = html.escape(name or "Unnamed product")
     description = html.escape(description or "")
     category_value = html.escape(category or "Uncategorized")
@@ -208,12 +212,12 @@ async def image(request):
         product_id = int(request.match_info["product_id"])
     except ValueError:
         raise web.HTTPNotFound()
-    async with aiosqlite.connect(DATABASE) as db:
-        cursor = await db.execute("SELECT image_id FROM products WHERE id = ?", (product_id,))
+    async with connection() as db:
+        cursor = await db.execute("SELECT image_id FROM products WHERE id = %s", (product_id,))
         row = await cursor.fetchone()
     if not row:
         raise web.HTTPNotFound()
-    file = await bot.get_file(row[0])
+    file = await bot.get_file(row["image_id"])
     output = io.BytesIO()
     await bot.download_file(file.file_path, output)
     return web.Response(body=output.getvalue(), content_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
@@ -244,10 +248,10 @@ async def place_order(request):
     except (KeyError, TypeError, ValueError):
         return web.json_response({"error": "Invalid products in cart."}, status=400)
 
-    placeholders = ",".join("?" for _ in quantities)
-    async with aiosqlite.connect(DATABASE) as db:
+    placeholders = ",".join("%s" for _ in quantities)
+    async with connection() as db:
         cursor = await db.execute(
-            f"SELECT id, name, price, stock FROM products WHERE user_id = ? AND id IN ({placeholders})",
+        f"SELECT id, name, price, stock FROM products WHERE user_id = %s AND id IN ({placeholders}) FOR UPDATE",
             (user_id, *quantities.keys()),
         )
         products = await cursor.fetchall()
@@ -257,13 +261,38 @@ async def place_order(request):
 
     lines = []
     total = 0
-    for product_id, product_name, price, stock in products:
+    for product in products:
+        product_id = product["id"]
+        product_name = product["name"]
+        price = product["price"]
+        stock = product["stock"]
         quantity = quantities[product_id]
         if quantity > stock:
             return web.json_response({"error": f"Only {stock} of {product_name} are available."}, status=409)
         line_total = price * quantity
         total += line_total
         lines.append(f"- {product_name} x {quantity} = ${line_total:.2f}")
+
+    order_cursor = await db.execute(
+        """INSERT INTO orders (shop_owner_id, customer_name, phone, address, total)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (user_id, name, phone, address or None, total),
+    )
+    order = await order_cursor.fetchone()
+    for product in products:
+        product_id = product["id"]
+        quantity = quantities[product_id]
+        await db.execute(
+            """INSERT INTO order_items
+               (order_id, product_id, product_name, unit_price, quantity)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (order["id"], product_id, product["name"], product["price"], quantity),
+        )
+        await db.execute(
+            "UPDATE products SET stock = stock - %s WHERE id = %s",
+            (quantity, product_id),
+        )
+    await db.commit()
 
     order_message = (
         "<b>New shop order</b>\n\n"
@@ -276,12 +305,32 @@ async def place_order(request):
     try:
         await bot.send_message(user_id, order_message, parse_mode="HTML")
     except Exception:
+        async with connection() as db:
+            await db.execute("UPDATE orders SET status = 'notification_failed' WHERE id = %s", (order["id"],))
+            await db.commit()
         return web.json_response({"error": "The shop owner could not receive this order."}, status=502)
 
     return web.json_response({"message": "Order sent successfully."})
 
 
+async def database_context(app):
+    await init_db()
+    try:
+        yield
+    finally:
+        await close_db()
+        await bot.session.close()
+
+
+async def health(request):
+    async with connection() as db:
+        await db.execute("SELECT 1")
+    return web.json_response({"status": "ok"})
+
+
 app = web.Application()
+app.cleanup_ctx.append(database_context)
+app.router.add_get("/health", health)
 app.router.add_get("/image/{product_id}", image)
 app.router.add_post("/order/{user_id}", place_order)
 app.router.add_get("/{user_id}", shop)

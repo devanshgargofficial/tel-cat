@@ -1,6 +1,5 @@
 import asyncio
 import os
-import aiosqlite
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -8,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from database import close_db, connection, init_db
 
 load_dotenv()
 
@@ -43,19 +43,19 @@ def category_keyboard(categories: list[str]) -> InlineKeyboardMarkup:
 
 
 async def send_products(message: Message, user_id: int, category: str | None = None):
-    async with aiosqlite.connect("catalogue.db") as db:
+    async with connection() as db:
         if category is None:
             cursor = await db.execute("""
                 SELECT id, image_id, description, name, price, category, stock
                 FROM products
-                WHERE user_id = ?
+                WHERE user_id = %s
                 ORDER BY id DESC
             """, (user_id,))
         else:
             cursor = await db.execute("""
                 SELECT id, image_id, description, name, price, category, stock
                 FROM products
-                WHERE user_id = ? AND LOWER(category) = LOWER(?)
+                WHERE user_id = %s AND LOWER(category) = LOWER(%s)
                 ORDER BY id DESC
             """, (user_id, category))
         products = await cursor.fetchall()
@@ -67,7 +67,14 @@ async def send_products(message: Message, user_id: int, category: str | None = N
             await message.answer(f'No products found in category "{category}".')
         return
 
-    for product_id, image_id, description, name, price, product_category, stock in products:
+    for product in products:
+        product_id = product["id"]
+        image_id = product["image_id"]
+        description = product["description"]
+        name = product["name"]
+        price = product["price"]
+        product_category = product["category"]
+        stock = product["stock"]
         details = f"{name}\n{description}\nPrice: {price:g}\nStock: {stock}"
         if product_category:
             details += f"\nCategory: {product_category}"
@@ -156,12 +163,12 @@ async def receive_stock(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    async with aiosqlite.connect("catalogue.db") as db:
+    async with connection() as db:
         if data.get("edit_id"):
             await db.execute("""
                 UPDATE products
-                SET description = ?, name = ?, price = ?, category = ?, stock = ?
-                WHERE id = ? AND user_id = ?
+                SET description = %s, name = %s, price = %s, category = %s, stock = %s
+                WHERE id = %s AND user_id = %s
             """, (
                 data["description"],
                 data["name"],
@@ -176,7 +183,7 @@ async def receive_stock(message: Message, state: FSMContext):
             await db.execute("""
                 INSERT INTO products
                     (user_id, image_id, description, name, price, category, stock)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 message.from_user.id,
                 data["image_id"],
@@ -200,14 +207,14 @@ async def show_catalog(message: Message):
 
 @dp.message(Command("listcat"))
 async def list_categories(message: Message):
-    async with aiosqlite.connect("catalogue.db") as db:
+    async with connection() as db:
         cursor = await db.execute("""
             SELECT DISTINCT category
             FROM products
-            WHERE user_id = ? AND category IS NOT NULL AND TRIM(category) != ''
+            WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
             ORDER BY category COLLATE NOCASE
         """, (message.from_user.id,))
-        categories = [row[0] for row in await cursor.fetchall()]
+        categories = [row["category"] for row in await cursor.fetchall()]
 
     if not categories:
         await message.answer("No categories found. Add a product with /new first.")
@@ -228,13 +235,13 @@ async def products_by_category(message: Message):
 @dp.callback_query(F.data.startswith("category:"))
 async def category_selected(callback: CallbackQuery):
     category_index = int(callback.data.split(":", 1)[1])
-    async with aiosqlite.connect("catalogue.db") as db:
+    async with connection() as db:
         cursor = await db.execute("""
             SELECT DISTINCT category
             FROM products
-            WHERE user_id = ? AND category IS NOT NULL AND TRIM(category) != ''
+            WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
             ORDER BY category COLLATE NOCASE
-            LIMIT 1 OFFSET ?
+            LIMIT 1 OFFSET %s
         """, (callback.from_user.id, category_index))
         selected = await cursor.fetchone()
 
@@ -243,15 +250,15 @@ async def category_selected(callback: CallbackQuery):
         return
 
     await callback.answer()
-    await send_products(callback.message, callback.from_user.id, selected[0])
+    await send_products(callback.message, callback.from_user.id, selected["category"])
 
 
 @dp.callback_query(F.data.startswith("delete:"))
 async def delete_product(callback: CallbackQuery):
     product_id = int(callback.data.split(":", 1)[1])
-    async with aiosqlite.connect("catalogue.db") as db:
+    async with connection() as db:
         await db.execute(
-            "DELETE FROM products WHERE id = ? AND user_id = ?",
+            "DELETE FROM products WHERE id = %s AND user_id = %s",
             (product_id, callback.from_user.id),
         )
         await db.commit()
@@ -262,10 +269,10 @@ async def delete_product(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("edit:"))
 async def edit_product(callback: CallbackQuery, state: FSMContext):
     product_id = int(callback.data.split(":", 1)[1])
-    async with aiosqlite.connect("catalogue.db") as db:
+    async with connection() as db:
         cursor = await db.execute(
             "SELECT id, image_id, description, name, price, category, stock "
-            "FROM products WHERE id = ? AND user_id = ?",
+            "FROM products WHERE id = %s AND user_id = %s",
             (product_id, callback.from_user.id),
         )
         product = await cursor.fetchone()
@@ -274,7 +281,7 @@ async def edit_product(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Item not found", show_alert=True)
         return
 
-    await state.update_data(edit_id=product_id, image_id=product[1])
+    await state.update_data(edit_id=product_id, image_id=product["image_id"])
     await state.set_state(ProductForm.waiting_for_description)
     await callback.message.answer("Send the new description.")
     await callback.answer()
@@ -287,33 +294,12 @@ async def cancel(message: Message, state: FSMContext):
 
 
 async def main():
-    async with aiosqlite.connect("catalogue.db") as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                image_id TEXT NOT NULL,
-                description TEXT NOT NULL,
-                name TEXT NOT NULL DEFAULT 'Unnamed product',
-                price REAL NOT NULL DEFAULT 0,
-                category TEXT,
-                stock INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        columns = await (await db.execute("PRAGMA table_info(products)")).fetchall()
-        existing_columns = {column[1] for column in columns}
-        migrations = {
-            "name": "ALTER TABLE products ADD COLUMN name TEXT NOT NULL DEFAULT 'Unnamed product'",
-            "price": "ALTER TABLE products ADD COLUMN price REAL NOT NULL DEFAULT 0",
-            "category": "ALTER TABLE products ADD COLUMN category TEXT",
-            "stock": "ALTER TABLE products ADD COLUMN stock INTEGER NOT NULL DEFAULT 0",
-        }
-        for column, migration in migrations.items():
-            if column not in existing_columns:
-                await db.execute(migration)
-        await db.commit()
-
-    await dp.start_polling(bot)
+    await init_db()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_db()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
