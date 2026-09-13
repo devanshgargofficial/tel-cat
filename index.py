@@ -1,6 +1,9 @@
 import asyncio
+import io
 import os
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -18,6 +21,8 @@ if not TOKEN:
 bot = Bot(TOKEN)
 dp = Dispatcher()
 SHOP_URL = os.getenv("SHOP_URL", "http://localhost:8080")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 class ProductForm(StatesGroup):
@@ -103,17 +108,56 @@ async def shop(message: Message):
 
 @dp.message(Command("new"))
 async def new_item(message: Message, state: FSMContext):
+    await state.update_data(auto_description=False)
     await state.set_state(ProductForm.waiting_for_image)
     await message.answer("Send me an image.")
+
+
+@dp.message(Command("new-auto"))
+async def new_auto_item(message: Message, state: FSMContext):
+    if gemini_client is None:
+        await message.answer("AI descriptions are not configured. Set GEMINI_API_KEY first.")
+        return
+    await state.update_data(auto_description=True)
+    await state.set_state(ProductForm.waiting_for_image)
+    await message.answer("Send me an image. I will generate the product description.")
 
 
 @dp.message(ProductForm.waiting_for_image, F.photo)
 async def receive_image(message: Message, state: FSMContext):
     image_id = message.photo[-1].file_id
 
-    await state.update_data(image_id=image_id)
-    await state.set_state(ProductForm.waiting_for_description)
-    await message.answer("Now send a description.")
+    data = await state.get_data()
+    if not data.get("auto_description"):
+        await state.update_data(image_id=image_id)
+        await state.set_state(ProductForm.waiting_for_description)
+        await message.answer("Now send a description.")
+        return
+
+    status = await message.answer("Analyzing the image...")
+    try:
+        telegram_file = await bot.get_file(image_id)
+        image_buffer = io.BytesIO()
+        await bot.download_file(telegram_file.file_path, image_buffer)
+        response = await gemini_client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(data=image_buffer.getvalue(), mime_type="image/jpeg"),
+                "Write a concise, appealing product description based only on this image. Do not invent specifications, prices, brands, or measurements.",
+            ],
+        )
+        description = (response.text or "").strip()
+        if not description:
+            raise RuntimeError("Gemini returned an empty description")
+    except Exception:
+        await status.edit_text("I could not generate a description. Please use /new instead.")
+        await state.clear()
+        return
+
+    await status.edit_text(f"Generated description:\n\n{description}")
+    await state.update_data(image_id=image_id, description=description)
+    await state.set_state(ProductForm.waiting_for_name)
+    await message.answer("Product name?")
 
 
 @dp.message(ProductForm.waiting_for_description, F.text)
