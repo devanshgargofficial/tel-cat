@@ -22,7 +22,7 @@ async def get_shop_data(user_id: int):
         category_cursor = await db.execute(
             """SELECT DISTINCT category FROM products
                WHERE user_id = %s AND category IS NOT NULL AND TRIM(category) != ''
-               ORDER BY category COLLATE NOCASE""",
+               ORDER BY LOWER(category)""",
             (user_id,),
         )
         categories = [row["category"] for row in await category_cursor.fetchall()]
